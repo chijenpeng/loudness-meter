@@ -1,0 +1,126 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to build and upload to
+        required: true
+        default: v0.1.0
+        type: string
+
+jobs:
+  build:
+    if: github.repository == 'chijenpeng/loudness-meter' && github.event.repository.private == false
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+
+    steps:
+      - name: Check out the requested release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify release tag and checked-out commit
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Expected a semantic version tag such as v0.1.0, got '$env:RELEASE_TAG'."
+          }
+          $head = (git rev-parse HEAD).Trim()
+          $tagCommit = (git rev-parse "$($env:RELEASE_TAG)^{commit}").Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $tagCommit) {
+            throw "Checked-out commit $head does not match tag $env:RELEASE_TAG ($tagCommit)."
+          }
+
+      - name: Configure native x64 Release build
+        shell: pwsh
+        run: >-
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release
+          -DCOPY_PLUGIN_AFTER_BUILD=OFF
+          "-DFETCHCONTENT_BASE_DIR=$env:RUNNER_TEMP/deps"
+
+      - name: Build VST3, tests, and snapshot utility
+        shell: pwsh
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Run native Windows tests
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Package VST3 and required notices
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $packageRoot = Join-Path $env:RUNNER_TEMP "Loudness-Meter-package"
+          $licenses = Join-Path $packageRoot "licenses"
+          $vst3Licenses = Join-Path $licenses "VST3-SDK"
+          $plugin = "build/LoudnessMeter_artefacts/Release/VST3/Loudness Meter.vst3"
+          if (-not (Test-Path -LiteralPath $plugin -PathType Container)) {
+            throw "Expected VST3 bundle was not built: $plugin"
+          }
+
+          New-Item -ItemType Directory -Force -Path $packageRoot, $licenses, $vst3Licenses | Out-Null
+          Copy-Item -LiteralPath $plugin -Destination (Join-Path $packageRoot "Loudness Meter.vst3") -Recurse
+          Copy-Item -LiteralPath README.md, THIRD_PARTY_NOTICES.md, LICENSE -Destination $packageRoot
+          @(
+            "Loudness Meter $version - Windows x64 VST3"
+            ""
+            "Copy \"Loudness Meter.vst3\" to C:\Program Files\Common Files\VST3\ (administrator rights are"
+            "required) or to a VST3 folder your host scans, then rescan plug-ins in your host."
+            "Requires the Microsoft Visual C++ x64 Redistributable."
+            "The plug-in is unsigned, so Windows may show a warning for the downloaded ZIP."
+            "See README.md for the controls, THIRD_PARTY_NOTICES.md and licenses/ for dependency"
+            "notices, LICENSE for the project licence and BUILD-INFO.txt for build provenance."
+          ) | Set-Content -LiteralPath (Join-Path $packageRoot "INSTALL.txt") -Encoding utf8
+          Copy-Item -LiteralPath Resources/fonts/Inter-LICENSE.txt -Destination $licenses
+          Copy-Item -LiteralPath Resources/fonts/JetBrainsMono-LICENSE.txt -Destination $licenses
+          $juce = Join-Path $env:RUNNER_TEMP "deps/juce-src"
+          if (-not (Test-Path -LiteralPath $juce -PathType Container)) {
+            throw "Expected fetched JUCE source was not found: $juce"
+          }
+          Copy-Item -LiteralPath (Join-Path $juce "LICENSE.md") -Destination (Join-Path $licenses "JUCE-LICENSE.md")
+
+          $sdk = Join-Path $juce "modules/juce_audio_processors/format_types/VST3_SDK"
+          Copy-Item -LiteralPath "$sdk/LICENSE.txt" -Destination (Join-Path $vst3Licenses "VST3-SDK-LICENSE.txt")
+          Copy-Item -LiteralPath "$sdk/base/LICENSE.txt" -Destination (Join-Path $vst3Licenses "base-LICENSE.txt")
+          Copy-Item -LiteralPath "$sdk/pluginterfaces/LICENSE.txt" -Destination (Join-Path $vst3Licenses "pluginterfaces-LICENSE.txt")
+          Copy-Item -LiteralPath "$sdk/public.sdk/LICENSE.txt" -Destination (Join-Path $vst3Licenses "public-sdk-LICENSE.txt")
+          Copy-Item -LiteralPath "$sdk/VST3_License_Agreement.pdf" -Destination $vst3Licenses
+
+          $sha = (git rev-parse HEAD).Trim()
+          @(
+            "Product: Loudness Meter"
+            "Version: $version"
+            "Release tag: $env:RELEASE_TAG"
+            "Source commit: $sha"
+            "Build: Windows x64 native MSVC Release"
+            "Tests: CTest passed on windows-2022"
+            "Code signing: unsigned"
+          ) | Set-Content -LiteralPath (Join-Path $packageRoot "BUILD-INFO.txt") -Encoding utf8
+
+          $zipPath = Join-Path $env:RUNNER_TEMP "Loudness-Meter-$version-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $packageRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
+          $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = "$zipPath.sha256"
+          [System.IO.File]::WriteAllText($shaPath, "$hash  $(Split-Path -Leaf $zipPath)`n", (New-Object System.Text.UTF8Encoding($false)))
+          "SHA_PATH=$shaPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PACKAGE_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload package and checksum to the existing draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $isDraft = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft --jq .isDraft
+          if ($LASTEXITCODE -ne 0 -or $isDraft.Trim() -ne "true") {
+            throw "Release $env:RELEASE_TAG must already exist as a draft."
+          }
+          gh release upload $env:RELEASE_TAG $env:PACKAGE_PATH $env:SHA_PATH --repo $env:GITHUB_REPOSITORY --clobber
