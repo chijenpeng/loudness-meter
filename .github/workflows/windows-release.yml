@@ -73,7 +73,7 @@ jobs:
           @(
             "Loudness Meter $version - Windows x64 VST3"
             ""
-            "Copy \"Loudness Meter.vst3\" to C:\Program Files\Common Files\VST3\ (administrator rights are"
+            'Copy "Loudness Meter.vst3" to C:\Program Files\Common Files\VST3\ (administrator rights are'
             "required) or to a VST3 folder your host scans, then rescan plug-ins in your host."
             "Requires the Microsoft Visual C++ x64 Redistributable."
             "The plug-in is unsigned, so Windows may show a warning for the downloaded ZIP."
